@@ -1,17 +1,15 @@
 /*
-   ESP32-C3 Super Mini - MIDI Footswitch
+   ESP32-C3 Super Mini - MIDI Footswitch (BLE MIDI + WiFi Web GUI)
    Port z Arduino Leonardo
 
-   Dziala tak samo jak wersja Arduino:
-   - 2 przyciski (prev/next preset)
-   - Pedał ekspresji (CC11)
-   - OLED 0.96" I2C
-   - Dual mode: JamVOX (CC80/81) + Overloud (CC16/17 pulse)
+   BLE MIDI - działa przez Bluetooth, sparuj z PC/telefonem
+   WiFi Web Server - config GUI na http://192.168.4.1 (AP mode)
 
    ROZNICE vs Arduino:
    - ADC 12-bit (0-4095) zamiast 10-bit (0-1023)
    - Logika 3.3V (pedal EX-P potrzebuje dzielnika 5V->3.3V)
-   - USB MIDI przez TinyUSB (nie MIDIUSB)
+   - BLE MIDI zamiast USB MIDI
+   - WiFi WebServer do konfiguracji
    - Inne piny GPIO
 
    PINY ESP32-C3 Super Mini:
@@ -20,18 +18,20 @@
    - GPIO3: Przycisk B (next)
    - GPIO4: OLED SDA
    - GPIO5: OLED SCL
-   - GPIO8: LED onboard (nie uzywany)
 
    WYMAGANIA:
    - Arduino IDE + ESP32 Core 3.x (Espressif Systems)
-   - Tools -> USB Mode -> TinyUSB
+   - Tools -> Board -> ESP32C3 Dev Module (lub Nologo ESP32C3 Super Mini)
    - Tools -> USB CDC On Boot -> Enabled
-   - Libraries: U8g2, USB-MIDI (lathoub)
+   - Libraries: U8g2, BLE-MIDI, NimBLE-Arduino
 */
 
-#include <USB-MIDI.h>
+#include <BLEMIDI_Transport.h>
+#include <hardware/BLEMIDI_ESP32_NimBLE.h>
 #include <Wire.h>
 #include <U8g2lib.h>
+#include <WiFi.h>
+#include <WebServer.h>
 
 // #define DEBUG_ON
 
@@ -40,7 +40,9 @@
 
 U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE, /* clock=*/ OLED_SCL, /* data=*/ OLED_SDA);
 
-USBMIDI_CREATE_INSTANCE(0, MIDI);
+BLEMIDI_CREATE_INSTANCE("Guitar Footswitch", MIDI);
+
+WebServer server(80);
 
 #define PEDAL_PIN    0
 #define BTN_A_PIN    1
@@ -71,6 +73,9 @@ USBMIDI_CREATE_INSTANCE(0, MIDI);
 
 #define HELP_MENU_ITEMS  6
 #define HELP_VISIBLE     4
+
+#define WIFI_AP_SSID "Guitar-Footswitch"
+#define WIFI_AP_PASS "12345678"
 
 int lastCCValue = -1;
 unsigned long lastPedalSend = 0;
@@ -109,6 +114,150 @@ int helpIdx = 0;
 int lastHelpState = -1;
 int lastHelpIdx = -1;
 
+bool bleConnected = false;
+
+const char PAGE_ROOT[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Guitar Footswitch</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh;padding:10px}
+.hdr{background:#16213e;padding:12px;border-radius:8px;text-align:center;margin-bottom:10px}
+.hdr h1{font-size:18px;color:#e94560}
+.card{background:#16213e;border-radius:8px;padding:14px;margin-bottom:10px}
+.card h2{font-size:14px;color:#e94560;margin-bottom:10px;border-bottom:1px solid #0f3460;padding-bottom:6px}
+.row{display:flex;align-items:center;justify-content:space-between;padding:6px 0}
+.row label{font-size:13px;flex:1}
+.btn{background:#0f3460;border:none;color:#eee;padding:10px 16px;border-radius:6px;font-size:13px;cursor:pointer;min-width:80px}
+.btn:active{background:#e94560}
+.btn.on{background:#e94560}
+.btn.off{background:#333}
+.status{font-size:12px;color:#aaa;text-align:center;padding:4px}
+.meter{width:100%;height:20px;background:#0f3460;border-radius:4px;overflow:hidden;margin:6px 0}
+.meter-fill{height:100%;background:#e94560;transition:width 0.1s;border-radius:4px}
+.info{font-size:11px;color:#666;text-align:center;margin-top:8px}
+.conn{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.conn.on{background:#0f0}
+.conn.off{background:#f00}
+</style>
+</head>
+<body>
+<div class="hdr">
+<h1>Guitar Footswitch</h1>
+<div class="status" id="st">BLE: <span class="conn off" id="blec"></span><span id="ble">disconnected</span></div>
+</div>
+
+<div class="card">
+<h2>Mode</h2>
+<div class="row">
+<label>Current mode:</label>
+<span id="modetxt" style="color:#e94560;font-weight:bold">Jam Vox</span>
+</div>
+<div class="row">
+<label>Set mode:</label>
+<button class="btn" onclick="send('/api?set=jamvox')">Jam Vox</button>
+<button class="btn" onclick="send('/api?set=overloud')">Overloud</button>
+</div>
+</div>
+
+<div class="card">
+<h2>Expression Pedal</h2>
+<div class="meter"><div class="meter-fill" id="pb" style="width:0%"></div></div>
+<div class="row">
+<label>Pedal value:</label>
+<span id="pv">0</span>
+</div>
+<div class="row">
+<label>Pedal invert:</label>
+<button class="btn" id="pinv" onclick="send('/api?toggle=pedalInvert')">OFF</button>
+</div>
+<div class="row">
+<label>FX pedal:</label>
+<button class="btn" id="fxoff" onclick="send('/api?toggle=fxOff')">ON</button>
+</div>
+</div>
+
+<div class="card">
+<h2>Buttons</h2>
+<div class="row">
+<label>Button swap:</label>
+<button class="btn" id="bswap" onclick="send('/api?toggle=btnSwap')">OFF</button>
+</div>
+<div class="row">
+<label>A = LEAD (prev)</label>
+</div>
+<div class="row">
+<label>B = CLEAN (next)</label>
+</div>
+</div>
+
+<div class="card">
+<h2>Info</h2>
+<div class="row"><label>IP Address:</label><span id="ip">-</span></div>
+<div class="row"><label>Uptime:</label><span id="up">-</span></div>
+</div>
+
+<div class="info">BLE MIDI: "Guitar Footswitch" | Connect via Bluetooth</div>
+
+<script>
+function send(u){fetch(u).then(r=>r.json()).then(j=>{update(j)}).catch(e=>{})}
+function update(j){
+  if(j.pedal!==undefined){document.getElementById('pb').style.width=(j.pedal*100/127)+'%';document.getElementById('pv').textContent=j.pedal}
+  if(j.pedalInvert!==undefined)document.getElementById('pinv').textContent=j.pedalInvert?'ON':'OFF';
+  if(j.pedalInvert!==undefined)document.getElementById('pinv').className='btn '+(j.pedalInvert?'on':'off');
+  if(j.fxOff!==undefined)document.getElementById('fxoff').textContent=j.fxOff?'OFF (muted)':'ON';
+  if(j.fxOff!==undefined)document.getElementById('fxoff').className='btn '+(j.fxOff?'on':'off');
+  if(j.btnSwap!==undefined)document.getElementById('bswap').textContent=j.btnSwap?'ON':'OFF';
+  if(j.btnSwap!==undefined)document.getElementById('bswap').className='btn '+(j.btnSwap?'on':'off');
+  if(j.mode!==undefined)document.getElementById('modetxt').textContent=j.mode=='overloud'?'Overloud TH-U':'Jam Vox';
+  if(j.bleConnected!==undefined){document.getElementById('blec').className='conn '+(j.bleConnected?'on':'off');document.getElementById('ble').textContent=j.bleConnected?'connected':'disconnected'}
+  if(j.ip!==undefined)document.getElementById('ip').textContent=j.ip;
+  if(j.uptime!==undefined){var s=j.uptime,m=Math.floor(s/60),h=Math.floor(m/60);m=m%60;document.getElementById('up').textContent=h+'h '+m+'m'}
+}
+setInterval(function(){send('/api?poll=1')},1000);
+send('/api?poll=1');
+</script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  server.send_P(200, "text/html", PAGE_ROOT);
+}
+
+void handleAPI() {
+  String resp = "{";
+  bool poll = server.hasArg("poll");
+
+  if (server.hasArg("set")) {
+    String mode = server.arg("set");
+    if (mode == "jamvox") { momentaryPulse = false; fxOff = false; }
+    else if (mode == "overloud") { momentaryPulse = true; fxOff = true; }
+  }
+
+  if (server.hasArg("toggle")) {
+    String t = server.arg("toggle");
+    if (t == "pedalInvert") pedalInverted = !pedalInverted;
+    else if (t == "btnSwap") btnSwap = !btnSwap;
+    else if (t == "fxOff") fxOff = !fxOff;
+  }
+
+  resp += "\"mode\":\"" + String(momentaryPulse ? "overloud" : "jamvox") + "\",";
+  resp += "\"pedal\":" + String((lastCCValue < 0) ? 0 : lastCCValue) + ",";
+  resp += "\"pedalInvert\":" + String(pedalInverted ? "true" : "false") + ",";
+  resp += "\"fxOff\":" + String(fxOff ? "true" : "false") + ",";
+  resp += "\"btnSwap\":" + String(btnSwap ? "true" : "false") + ",";
+  resp += "\"bleConnected\":" + String(bleConnected ? "true" : "false") + ",";
+  resp += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  resp += "\"uptime\":" + String(millis() / 1000);
+  resp += "}";
+
+  server.send(200, "application/json", resp);
+}
 
 void setup() {
   pinMode(BTN_A_PIN, INPUT_PULLUP);
@@ -116,25 +265,39 @@ void setup() {
   analogReadResolution(12);
   windowStart = millis();
   u8g2.begin();
+
   MIDI.begin(MIDI_CHANNEL_OMNI);
+  BLEMIDI.setHandleConnected([]() { bleConnected = true; });
+  BLEMIDI.setHandleDisconnected([]() { bleConnected = false; });
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS);
+  server.on("/", handleRoot);
+  server.on("/api", handleAPI);
+  server.begin();
+
 #ifdef DEBUG_ON
   Serial.begin(115200);
   Serial.println("--- ESP32-C3 footswitch ready ---");
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
 #endif
 }
 
 
 void loop() {
+  server.handleClient();
   MIDI.read();
   readPedal();
   readButtons();
   updateOled();
+#ifdef DEBUG_ON
   testMode();
+#endif
 }
 
 
 void testMode() {
-#ifdef DEBUG_ON
   static boolean testOn = false;
   static unsigned long lastTestSend = 0;
 
@@ -147,12 +310,11 @@ void testMode() {
   }
 
   if (testOn && millis() - lastTestSend >= 500) {
-    controlChange(0, CC_OVERLOUD_PREV, 127);
-    controlChange(0, CC_OVERLOUD_NEXT, 127);
+    MIDI.sendControlChange(CC_OVERLOUD_PREV, 127, 1);
+    MIDI.sendControlChange(CC_OVERLOUD_NEXT, 127, 1);
     Serial.println("Sent CC16+CC17=127");
     lastTestSend = millis();
   }
-#endif
 }
 
 
@@ -166,12 +328,6 @@ void readPedal() {
     if (winMax - winMin >= MIN_SPREAD) {
       pedalMin = winMin;
       pedalMax = winMax;
-#ifdef DEBUG_ON
-      Serial.print("Range: min=");
-      Serial.print(pedalMin);
-      Serial.print(" max=");
-      Serial.println(pedalMax);
-#endif
     }
     winMin = PEDAL_RAW_MAX;
     winMax = 0;
@@ -185,7 +341,7 @@ void readPedal() {
   if (scaled > 127) scaled = 127;
   if (pedalInverted) scaled = 127 - scaled;
   if (!fxOff && abs((int)scaled - lastCCValue) >= PEDAL_HYSTERESIS) {
-    controlChange(0, CC_EXPRESSION, (byte)scaled);
+    MIDI.sendControlChange(CC_EXPRESSION, (byte)scaled, 1);
     lastCCValue = (int)scaled;
   }
   lastPedalSend = millis();
@@ -198,12 +354,9 @@ void sendButtonA(boolean pressed) {
   if (pressed) {
     btnABlink = true;
     btnBBlink = false;
-    controlChange(0, cc, 127);
-    controlChange(0, cc, 0);
+    MIDI.sendControlChange(cc, 127, 1);
+    if (momentaryPulse) MIDI.sendControlChange(cc, 0, 1);
   }
-#ifdef DEBUG_ON
-  if (pressed) { Serial.print("BTN A -> CC"); Serial.print(cc); Serial.println(" pulse"); }
-#endif
 }
 
 void sendButtonB(boolean pressed) {
@@ -212,12 +365,9 @@ void sendButtonB(boolean pressed) {
   if (pressed) {
     btnBBlink = true;
     btnABlink = false;
-    controlChange(0, cc, 127);
-    controlChange(0, cc, 0);
+    MIDI.sendControlChange(cc, 127, 1);
+    if (momentaryPulse) MIDI.sendControlChange(cc, 0, 1);
   }
-#ifdef DEBUG_ON
-  if (pressed) { Serial.print("BTN B -> CC"); Serial.print(cc); Serial.println(" pulse"); }
-#endif
 }
 
 
@@ -452,7 +602,11 @@ void updateOled() {
     u8g2.drawBox(0, 0, 128, 10);
     u8g2.setColorIndex(0);
     u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.drawStr(momentaryPulse ? 28 : 13, 8, momentaryPulse ? "OVERLOUD TH3" : "Jam Vox-M-Audio FX");
+    if (bleConnected) {
+      u8g2.drawStr(momentaryPulse ? 28 : 13, 8, momentaryPulse ? "OVERLOUD TH3" : "Jam Vox-M-Audio FX");
+    } else {
+      u8g2.drawStr(16, 8, "BLE: not connected");
+    }
     u8g2.setColorIndex(1);
 
     if (msgOn) {
@@ -482,9 +636,4 @@ void updateOled() {
   } while (u8g2.nextPage());
   lastOledCC = cc;
   lastOledUpdate = millis();
-}
-
-
-void controlChange(byte channel, byte control, byte value) {
-  MIDI.sendControlChange(control, value, channel + 1);
 }
